@@ -65,6 +65,18 @@ const AGENT_STEPS = [
   { key: "ActionAgent", label: "Open Issues & PRs" },
 ];
 
+const getApiBase = () => {
+  if (process.env.NEXT_PUBLIC_API_URL) {
+    return process.env.NEXT_PUBLIC_API_URL;
+  }
+  if (typeof window !== "undefined") {
+    const host = window.location.hostname;
+    const protocol = window.location.protocol;
+    return `${protocol}//${host}:8001`;
+  }
+  return "";
+};
+
 export default function ScanLivePage() {
   const { id } = useParams() as { id: string };
   const [events, setEvents] = useState<AgentEvent[]>([]);
@@ -73,19 +85,57 @@ export default function ScanLivePage() {
   const [done, setDone] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
 
-  // SSE connection
+  // Load initial scan data and set done state if already finished
   useEffect(() => {
-    const evtSource = new EventSource(`/api/scans/${id}/stream`);
-    setConnected(true);
+    fetch(`${getApiBase()}/api/scans/${id}`)
+      .then((r) => r.json())
+      .then((d) => {
+        setScanData(d);
+        if (d.status === "completed" || d.status === "error") {
+          setDone(true);
+        }
+      })
+      .catch(() => {});
+  }, [id]);
+
+  // SSE connection with deduplication
+  useEffect(() => {
+    const apiBase = getApiBase();
+    const evtSource = new EventSource(`${apiBase}/api/scans/${id}/stream`);
+
+    evtSource.onopen = () => {
+      setConnected(true);
+    };
 
     evtSource.onmessage = (e) => {
       const payload = JSON.parse(e.data);
       if (payload.done) {
-        setDone(true);
+        // Fetch the final scan data one last time to capture the persisted results!
+        const apiBaseUrl = getApiBase();
+        fetch(`${apiBaseUrl}/api/scans/${id}`)
+          .then((r) => r.json())
+          .then((d) => {
+            setScanData(d);
+            setDone(true);
+          })
+          .catch(() => {
+            setDone(true);
+          });
         evtSource.close();
         return;
       }
-      setEvents((prev) => [...prev, payload]);
+      setEvents((prev) => {
+        // Prevent duplicate events
+        const exists = prev.some(
+          (ev) =>
+            ev.agent === payload.agent &&
+            ev.status === payload.status &&
+            ev.message === payload.message &&
+            ev.timestamp === payload.timestamp
+        );
+        if (exists) return prev;
+        return [...prev, payload];
+      });
     };
 
     evtSource.onerror = () => {
@@ -96,25 +146,39 @@ export default function ScanLivePage() {
     return () => evtSource.close();
   }, [id]);
 
-  // Poll for final scan data
-  useEffect(() => {
-    if (!done) return;
-    fetch(`/api/scans/${id}`)
-      .then((r) => r.json())
-      .then((d) => setScanData(d))
-      .catch(() => {});
-  }, [done, id]);
-
   // Auto-scroll events
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [events]);
 
   const agentStatus = (agentKey: string) => {
+    // 1. Check if scan itself is completed or errored
+    if (scanData?.status === "completed") return "done";
+    
+    // For specific agents, we can check DB fields as a absolute source of truth
+    if (scanData) {
+      if (agentKey === "FetchAgent" && scanData.findings.length > 0) return "done";
+      if (agentKey === "AuditAgent" && scanData.findings.length > 0) return "done";
+      if (agentKey === "PrioritizerAgent" && scanData.health_score !== null) return "done";
+      if (agentKey === "FixAgent" && scanData.status === "completed") return "done";
+      if (agentKey === "ActionAgent" && scanData.status === "completed") return "done";
+    }
+
+    // 2. Fall back to event logs for real-time streaming
     const ev = events
       .filter((e) => e.agent === agentKey)
       .pop();
-    if (!ev) return "pending";
+    if (!ev) {
+      // If we are currently running a later step, then earlier steps MUST be completed!
+      const currentRunningIndex = AGENT_STEPS.findIndex(
+        (step) => events.some((e) => e.agent === step.key && e.status === "running")
+      );
+      const stepIndex = AGENT_STEPS.findIndex((step) => step.key === agentKey);
+      if (currentRunningIndex !== -1 && stepIndex < currentRunningIndex) {
+        return "done";
+      }
+      return "pending";
+    }
     return ev.status;
   };
 
@@ -173,27 +237,49 @@ export default function ScanLivePage() {
               <div className="space-y-3">
                 {AGENT_STEPS.map((step, i) => {
                   const status = agentStatus(step.key);
+                  const isRunning = status === "running";
+                  const isDone = status === "done";
+                  const isError = status === "error";
+
                   return (
                     <div
                       key={step.key}
-                      className="flex items-center gap-3 rounded-lg p-2.5 transition"
+                      className={`flex items-center gap-4 rounded-xl p-3.5 border transition-all duration-300 ${
+                        isRunning
+                          ? "bg-blue-50/50 border-blue-200 shadow-sm animate-glow-pulse scale-[1.02]"
+                          : isDone
+                          ? "bg-slate-50/50 border-slate-100 opacity-90"
+                          : "bg-white border-transparent opacity-60"
+                      }`}
                     >
-                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-slate-100 text-xs font-bold text-slate-600">
-                        {status === "done" ? (
-                          <CheckCircle2 className="h-5 w-5 text-green-600" />
-                        ) : status === "running" ? (
-                          <Loader2 className="h-5 w-5 animate-spin text-blue-600" />
-                        ) : status === "error" ? (
-                          <XCircle className="h-5 w-5 text-red-500" />
+                      <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full font-bold text-sm transition-all duration-300 ${
+                        isDone
+                          ? "bg-green-100 text-green-600 animate-bounce-scale"
+                          : isRunning
+                          ? "bg-blue-600 text-white shadow-md shadow-blue-500/20"
+                          : isError
+                          ? "bg-red-100 text-red-600 animate-pulse"
+                          : "bg-slate-100 text-slate-500"
+                      }`}>
+                        {isDone ? (
+                          <CheckCircle2 className="h-5 w-5" />
+                        ) : isRunning ? (
+                          <Loader2 className="h-5 w-5 animate-spin" />
+                        ) : isError ? (
+                          <XCircle className="h-5 w-5" />
                         ) : (
                           i + 1
                         )}
                       </div>
                       <div className="flex-1">
-                        <p className="text-sm font-medium text-slate-800">
+                        <p className={`text-sm font-semibold transition-colors ${
+                          isRunning ? "text-blue-800" : isDone ? "text-slate-700" : "text-slate-500"
+                        }`}>
                           {step.label}
                         </p>
-                        <p className="text-xs text-slate-500">
+                        <p className={`text-xs transition-colors ${
+                          isRunning ? "text-blue-600 font-medium animate-pulse" : "text-slate-400"
+                        }`}>
                           {status === "pending"
                             ? "Waiting…"
                             : status === "running"
@@ -203,7 +289,9 @@ export default function ScanLivePage() {
                             : "Failed"}
                         </p>
                       </div>
-                      <ChevronRight className="h-4 w-4 text-slate-300" />
+                      <ChevronRight className={`h-4 w-4 transition-colors ${
+                        isRunning ? "text-blue-400 animate-pulse" : "text-slate-300"
+                      }`} />
                     </div>
                   );
                 })}
@@ -259,6 +347,25 @@ export default function ScanLivePage() {
 
           {/* Right Panel — Findings */}
           <div className="lg:col-span-7 space-y-4">
+            {/* Active Audit Status Banner */}
+            {!done && (
+              <div className="rounded-xl bg-gradient-to-r from-blue-600 via-indigo-600 to-blue-600 p-[1px] shadow-md shadow-blue-500/10 animate-pulse">
+                <div className="rounded-[11px] bg-white/95 backdrop-blur-md px-5 py-4 flex items-center justify-between gap-4">
+                  <div className="flex items-center gap-3">
+                    <span className="relative flex h-3 w-3">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-3 w-3 bg-blue-600"></span>
+                    </span>
+                    <div>
+                      <p className="text-sm font-semibold text-slate-800">Autonomous Healing Pipeline Active</p>
+                      <p className="text-xs text-slate-500">RepoSage agents are actively crawling, auditing, and patching the repository...</p>
+                    </div>
+                  </div>
+                  <Loader2 className="h-5 w-5 animate-spin text-blue-600 shrink-0" />
+                </div>
+              </div>
+            )}
+
             {/* Health Score */}
             {health && (
               <div className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
@@ -268,7 +375,7 @@ export default function ScanLivePage() {
                       Health Score
                     </h2>
                     <p className="mt-1 text-3xl font-extrabold text-slate-900">
-                      {health.overall}
+                      {typeof health.overall === "number" ? health.overall.toFixed(1) : health.overall}
                       <span className="text-lg font-medium text-slate-400">
                         /100
                       </span>
@@ -284,17 +391,17 @@ export default function ScanLivePage() {
                     { label: "Test Coverage", value: health.test_coverage, color: "bg-emerald-500" },
                   ].map((dim) => (
                     <div key={dim.label} className="text-center">
-                      <div className="mb-1 text-xs font-medium text-slate-500">
+                      <div className="mb-1 text-[10px] font-semibold text-slate-500 uppercase tracking-wider">
                         {dim.label}
                       </div>
                       <div className="h-2 w-full rounded-full bg-slate-100">
                         <div
-                          className={`h-2 rounded-full ${dim.color} transition-all`}
+                          className={`h-2 rounded-full ${dim.color} transition-all duration-500`}
                           style={{ width: `${dim.value}%` }}
                         />
                       </div>
                       <div className="mt-0.5 text-xs font-bold text-slate-700">
-                        {dim.value}
+                        {typeof dim.value === "number" ? dim.value.toFixed(1) : dim.value}
                       </div>
                     </div>
                   ))}
@@ -303,8 +410,15 @@ export default function ScanLivePage() {
             )}
 
             {/* Findings */}
-            <div className="rounded-xl bg-white shadow-sm ring-1 ring-slate-200">
-              <div className="border-b border-slate-100 px-5 py-3">
+            <div className="relative overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-slate-200">
+              {/* Animated Neon Scanning Line */}
+              {!done && (
+                <>
+                  <div className="absolute left-0 right-0 h-[2px] bg-gradient-to-r from-transparent via-blue-500 to-transparent opacity-80 animate-scanner z-10" />
+                  <div className="absolute inset-0 bg-blue-50/5 pointer-events-none z-0" />
+                </>
+              )}
+              <div className="border-b border-slate-100 px-5 py-3 relative z-10 bg-white">
                 <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-500">
                   Findings
                   {findings.length > 0 && (

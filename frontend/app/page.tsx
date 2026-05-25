@@ -5,6 +5,18 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { Activity, ArrowRight, Github, Shield, Sparkles, Zap } from "lucide-react";
 
+const getApiBase = () => {
+  if (process.env.NEXT_PUBLIC_API_URL) {
+    return process.env.NEXT_PUBLIC_API_URL;
+  }
+  if (typeof window !== "undefined") {
+    const host = window.location.hostname;
+    const protocol = window.location.protocol;
+    return `${protocol}//${host}:8001`;
+  }
+  return "";
+};
+
 export default function HomePage() {
   const [repoUrl, setRepoUrl] = useState("");
   const [token, setToken] = useState("");
@@ -15,7 +27,7 @@ export default function HomePage() {
   const [loadingRecent, setLoadingRecent] = useState(true);
 
   useEffect(() => {
-    fetch("/api/scans/recent")
+    fetch(`${getApiBase()}/api/scans/recent`)
       .then((res) => {
         if (!res.ok) throw new Error("Failed to fetch recent scans");
         return res.json();
@@ -37,9 +49,9 @@ export default function HomePage() {
       setError("Please enter a GitHub repository URL.");
       return;
     }
-    setLoading(true);
+    loading_label: setLoading(true);
     try {
-      const res = await fetch("/api/scans", {
+      const res = await fetch(`${getApiBase()}/api/scans`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ repo_url: repoUrl, github_token: token }),

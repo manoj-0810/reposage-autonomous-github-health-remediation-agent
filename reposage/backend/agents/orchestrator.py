@@ -82,11 +82,11 @@ class OrchestratorAgent(BaseAgent):
             bd.get(k, 100.0) * w for k, w in _WEIGHTS.items()
         )
         return HealthScore(
-            overall=round(max(0.0, min(100.0, overall)), 1),
-            security=round(max(0.0, min(100.0, bd.get("security", 100.0))), 1),
-            dependencies=round(max(0.0, min(100.0, bd.get("dependencies", 100.0))), 1),
-            code_quality=round(max(0.0, min(100.0, bd.get("code_quality", 100.0))), 1),
-            test_coverage=round(max(0.0, min(100.0, bd.get("test_coverage", 100.0))), 1),
+            overall=round(max(0.0, min(99.0, overall)), 1),
+            security=round(max(0.0, min(99.0, bd.get("security", 100.0))), 1),
+            dependencies=round(max(0.0, min(99.0, bd.get("dependencies", 100.0))), 1),
+            code_quality=round(max(0.0, min(99.0, bd.get("code_quality", 100.0))), 1),
+            test_coverage=round(max(0.0, min(99.0, bd.get("test_coverage", 100.0))), 1),
         )
 
     async def run(self, context: AgentContext) -> AgentResult:

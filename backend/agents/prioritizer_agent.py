@@ -58,16 +58,12 @@ class PrioritizerAgent(BaseAgent):
         Severity.LOW: 1.0,
     }
 
-    async def _llm_blast_radius(self, findings: List[AuditFinding]) -> Dict[int, int]:
-        """Ask Groq Llama 3.3 for blast-radius estimates."""
+    async def _llm_blast_radius(self, findings: List[AuditFinding], use_gemini: bool = False) -> Dict[int, int]:
+        """Ask Groq Llama 3.3 or Gemini Flash for blast-radius estimates."""
         if not findings:
             return {}
         import os
         import httpx
-        api_key = os.getenv("GROQ_API_KEY", "")
-        if not api_key:
-            # fallback: heuristic based on category (no GROQ_API_KEY set)
-            return {i: 3 for i in range(len(findings))}
 
         # slim JSON to fit context window
         slim = []
@@ -81,6 +77,47 @@ class PrioritizerAgent(BaseAgent):
             })
 
         prompt = _PROMPT.format(findings_json=json.dumps(slim[:50]))
+
+        if use_gemini:
+            api_key = os.getenv("GEMINI_API_KEY", "")
+            if not api_key:
+                return {i: 3 for i in range(len(findings))}
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"gemini-2.5-flash:generateContent?key={api_key}"
+            )
+            body = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4096},
+            }
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    r = await client.post(url, json=body)
+                    r.raise_for_status()
+                    data = r.json()
+                candidates = data.get("candidates", [])
+                if not candidates:
+                    return {i: 3 for i in range(len(findings))}
+                content = candidates[0]["content"]["parts"][0].get("text", "{}")
+                # extract JSON
+                import re as _re
+                m = _re.search(r'\{.*\}', content, _re.DOTALL)
+                if not m:
+                    return {i: 3 for i in range(len(findings))}
+                obj = json.loads(m.group())
+                scores = {}
+                for entry in obj.get("scores", []):
+                    scores[entry["index"]] = entry.get("blast_radius", 3)
+                return scores
+            except Exception:
+                return {i: 3 for i in range(len(findings))}
+
+        # Standard Groq path
+        api_key = os.getenv("GROQ_API_KEY", "")
+        if not api_key:
+            # fallback: heuristic based on category (no GROQ_API_KEY set)
+            return {i: 3 for i in range(len(findings))}
+
         url = "https://api.groq.com/openai/v1/chat/completions"
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         body = {
@@ -125,8 +162,11 @@ class PrioritizerAgent(BaseAgent):
         self._emit(context, AgentStatus.RUNNING,
                    f"Prioritizing {len(findings)} findings …")
 
+        file_tree_len = len(context.snapshot.file_tree) if context.snapshot else 0
+        use_gemini = file_tree_len <= 15
+
         # 1. get blast radius from LLM
-        blast_map = await self._llm_blast_radius(findings)
+        blast_map = await self._llm_blast_radius(findings, use_gemini=use_gemini)
 
         # 2. compute priority score for each
         scored: List[Tuple[float, AuditFinding, int]] = []

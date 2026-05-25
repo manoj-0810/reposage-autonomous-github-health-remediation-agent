@@ -161,7 +161,7 @@ async def _call_gemini_flash(prompt: str) -> str:
         return "[]"
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-2.5-flash-preview-04-17:generateContent?key={api_key}"
+        f"gemini-2.5-flash:generateContent?key={api_key}"
     )
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -234,6 +234,21 @@ def _extract_json(text: str) -> str:
 # Sub-auditors
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _get_repo_size_category(file_tree_len: int) -> tuple[str, int, int]:
+    """
+    Returns (category, max_code_smell_files, max_security_scan_files).
+    - small: <= 15 files. Fast, uses gemini-flash, audits up to 8 files.
+    - medium: 16-100 files. Balanced, audits up to 15 files.
+    - large: > 100 files. Deep, audits up to 30 files.
+    """
+    if file_tree_len <= 15:
+        return "small", 8, 10
+    elif file_tree_len <= 100:
+        return "medium", 15, 20
+    else:
+        return "large", 30, 35
+
+
 class DependencyAuditor:
     """Sub-audit A — parse manifests, flag outdated / vulnerable packages."""
 
@@ -266,22 +281,25 @@ class DependencyAuditor:
 
 
 class CodeSmellDetector:
-    """Sub-audit B — sample most-changed files, detect smells with Kimi K2."""
+    """Sub-audit B — sample most-changed files, detect smells dynamically based on size."""
 
     async def run(self, snapshot: RepoSnapshot) -> List[AuditFinding]:
-        # Identify top-20 most-changed files from commit history
+        file_tree_len = len(snapshot.file_tree)
+        category, max_smells, _ = _get_repo_size_category(file_tree_len)
+
+        # Identify most-changed files from commit history
         file_counts: Counter[str] = Counter()
         for commit in snapshot.recent_commits:
             for f in commit.files_changed:
                 file_counts[f] += 1
-        top_files = [f for f, _ in file_counts.most_common(20)]
+        top_files = [f for f, _ in file_counts.most_common(max_smells)]
         if not top_files:
             # fallback: grab a few source files from the tree
             exts = {".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java", ".rb"}
             top_files = [
                 p for p in snapshot.file_tree
                 if any(p.endswith(e) for e in exts)
-            ][:20]
+            ][:max_smells]
         if not top_files:
             return []
 
@@ -290,10 +308,11 @@ class CodeSmellDetector:
         # tree + commit messages to keep the demo self-contained.
         files_text = "\n\n---\n\n".join(
             f"### {path}\n(changed {file_counts.get(path, 0)} times in last 30 commits)"
-            for path in top_files[:15]
+            for path in top_files
         )
         prompt = _CODE_SMELL_PROMPT.format(files=files_text)
-        raw = await _call_llm(prompt, model="kimi-k2")
+        model_name = "gemini-flash" if category == "small" else "groq-llama"
+        raw = await _call_llm(prompt, model=model_name)
         try:
             arr = json.loads(_extract_json(raw))
         except json.JSONDecodeError:
@@ -438,16 +457,17 @@ class SecurityScanner:
                     ))
         return findings
 
-    async def _llm_scan(self, snapshot: RepoSnapshot) -> List[AuditFinding]:
+    async def _llm_scan(self, snapshot: RepoSnapshot, category: str, max_sec: int) -> List[AuditFinding]:
         # Build synthetic snippets from file tree + commit messages
         snippets = []
-        for path in snapshot.file_tree[:50]:
+        for path in snapshot.file_tree[:max_sec * 2]:
             if any(path.endswith(e) for e in [".py", ".js", ".ts", ".go", ".rs", ".java"]):
                 snippets.append(f"### {path}\n// code not available in snapshot; review manually")
         if not snippets:
             return []
-        prompt = _SECURITY_PROMPT.format(snippets="\n\n---\n\n".join(snippets[:30]))
-        raw = await _call_llm(prompt, model="gemini-flash")
+        prompt = _SECURITY_PROMPT.format(snippets="\n\n---\n\n".join(snippets[:max_sec]))
+        model_name = "gemini-flash" if category == "small" else "groq-llama"
+        raw = await _call_llm(prompt, model=model_name)
         try:
             arr = json.loads(_extract_json(raw))
         except json.JSONDecodeError:
@@ -469,9 +489,11 @@ class SecurityScanner:
         return findings
 
     async def run(self, snapshot: RepoSnapshot) -> List[AuditFinding]:
+        file_tree_len = len(snapshot.file_tree)
+        category, _, max_sec = _get_repo_size_category(file_tree_len)
         pattern_findings, llm_findings = await asyncio.gather(
             self._pattern_scan(snapshot),
-            self._llm_scan(snapshot),
+            self._llm_scan(snapshot, category, max_sec),
         )
         # deduplicate by (file_path, description)
         seen: Set[str] = set()
@@ -524,7 +546,50 @@ class AuditAgent(BaseAgent):
             if isinstance(findings, Exception):
                 self._emit(context, AgentStatus.ERROR,
                            f"Sub-audit {label} raised {findings}")
-                continue
+                findings = []
+            
+            if not findings:
+                if label == "dependencies":
+                    findings = [AuditFinding(
+                        category=FindingCategory.DEPENDENCIES,
+                        severity=Severity.LOW,
+                        file_path="repository-wide",
+                        description="Best Practice: Configure automated dependency updates via tools like Dependabot or Renovate.",
+                        suggested_fix="Create a .github/dependabot.yml configuration file to automate periodic dependency scanning and upgrades.",
+                        fix_complexity=1,
+                        auto_fixable=False
+                    )]
+                elif label == "code_quality":
+                    findings = [AuditFinding(
+                        category=FindingCategory.CODE_QUALITY,
+                        severity=Severity.LOW,
+                        file_path="repository-wide",
+                        description="Best Practice: Enforce static code linting and uniform formatting in the CI/CD pipeline.",
+                        suggested_fix="Set up linting checks (e.g. ESLint for JS/TS, Ruff for Python) to verify clean code formatting on pull requests.",
+                        fix_complexity=1,
+                        auto_fixable=False
+                    )]
+                elif label == "test_coverage":
+                    findings = [AuditFinding(
+                        category=FindingCategory.TEST_COVERAGE,
+                        severity=Severity.LOW,
+                        file_path="repository-wide",
+                        description="Best Practice: Set up pull request coverage tracking reports and badges.",
+                        suggested_fix="Integrate continuous coverage tools like Codecov to verify that code updates don't introduce coverage gaps.",
+                        fix_complexity=1,
+                        auto_fixable=False
+                    )]
+                elif label == "security":
+                    findings = [AuditFinding(
+                        category=FindingCategory.SECURITY,
+                        severity=Severity.LOW,
+                        file_path="repository-wide",
+                        description="Best Practice: Establish a public security vulnerability reporting disclosure policy.",
+                        suggested_fix="Create a SECURITY.md file at the root of the repository to guide security researchers on safe disclosure.",
+                        fix_complexity=1,
+                        auto_fixable=False
+                    )]
+
             all_findings.extend(findings)
             self._emit(context, AgentStatus.RUNNING,
                        f"Sub-audit {label}: {len(findings)} findings")

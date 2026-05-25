@@ -38,6 +38,18 @@ interface HistoryEntry {
 const COLORS = ["#ef4444", "#3b82f6", "#a855f7", "#10b981"];
 const DIMENSION_LABELS = ["Security", "Dependencies", "Code Quality", "Test Coverage"];
 
+const getApiBase = () => {
+  if (process.env.NEXT_PUBLIC_API_URL) {
+    return process.env.NEXT_PUBLIC_API_URL;
+  }
+  if (typeof window !== "undefined") {
+    const host = window.location.hostname;
+    const protocol = window.location.protocol;
+    return `${protocol}//${host}:8001`;
+  }
+  return "";
+};
+
 export default function RepoDashboardPage() {
   const { owner, repo } = useParams() as { owner: string; repo: string };
   const [history, setHistory] = useState<HistoryEntry[]>([]);
@@ -48,7 +60,7 @@ export default function RepoDashboardPage() {
   const decodedRepo = decodeURIComponent(repo);
 
   useEffect(() => {
-    fetch(`/api/repos/${decodedOwner}/${decodedRepo}/history`)
+    fetch(`${getApiBase()}/api/repos/${decodedOwner}/${decodedRepo}/history`)
       .then((r) => {
         if (!r.ok) throw new Error("Failed to load history");
         return r.json();

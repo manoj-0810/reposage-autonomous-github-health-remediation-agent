@@ -26,6 +26,8 @@ router = APIRouter()
 
 # In-memory queue per scan_id for SSE.
 _event_queues: Dict[str, asyncio.Queue[AgentEvent]] = {}
+# In-memory event history per scan_id to support replay on connect/reconnect.
+_event_history: Dict[str, List[AgentEvent]] = {}
 
 
 class ScanRequestBody(BaseModel):
@@ -49,16 +51,19 @@ def _parse_json(val: Any) -> Any:
         except Exception:
             return val
     return val
-
-
 async def _run_pipeline(scan_id: str, repo_url: str, token: str) -> None:
     """Background task that runs the full agent pipeline."""
     owner, repo = _parse_repo_url(repo_url)
 
+    import os
+    effective_token = token.strip() if token else ""
+    if not effective_token:
+        effective_token = os.getenv("GITHUB_TOKEN", "")
+
     ctx = AgentContext(
         scan_id=scan_id,
         repo_url=repo_url,
-        github_token=token,
+        github_token=effective_token,
         owner=owner,
         repo=repo,
     )
@@ -68,6 +73,11 @@ async def _run_pipeline(scan_id: str, repo_url: str, token: str) -> None:
 
     # wire event → queue so SSE clients receive it
     def _on_event(ev: AgentEvent) -> None:
+        # Save to scan's event history list
+        if scan_id not in _event_history:
+            _event_history[scan_id] = []
+        _event_history[scan_id].append(ev)
+
         q = _event_queues.get(ev.scan_id)
         if q:
             try:
@@ -156,11 +166,27 @@ async def get_scan(scan_id: str) -> Dict[str, Any]:
 
 @router.get("/api/scans/{scan_id}/stream")
 async def stream_scan(scan_id: str) -> StreamingResponse:
+    # Get or create queue and history list
+    history = _event_history.get(scan_id, [])
     q = _event_queues.get(scan_id)
-    if not q:
-        raise HTTPException(status_code=404, detail="Scan stream not found")
+    if q is None:
+        q = asyncio.Queue(maxsize=500)
+        _event_queues[scan_id] = q
 
     async def _event_generator() -> AsyncGenerator[str, None]:
+        # 1. First yield all historical events that have run so far
+        for event in list(history):
+            payload = {
+                "scan_id": event.scan_id,
+                "agent": event.agent,
+                "status": event.status.value,
+                "message": event.message,
+                "timestamp": event.timestamp.isoformat(),
+                "data": event.data,
+            }
+            yield f"data: {json.dumps(payload)}\n\n"
+
+        # 2. Yield new events in real-time as they arrive
         while True:
             event = await q.get()
             if event is None:
@@ -180,8 +206,9 @@ async def stream_scan(scan_id: str) -> StreamingResponse:
         _event_generator(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
         },
     )
 
