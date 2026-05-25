@@ -51,6 +51,8 @@ def _parse_json(val: Any) -> Any:
         except Exception:
             return val
     return val
+
+
 async def _run_pipeline(scan_id: str, repo_url: str, token: str) -> None:
     """Background task that runs the full agent pipeline."""
     owner, repo = _parse_repo_url(repo_url)

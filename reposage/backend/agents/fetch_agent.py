@@ -258,12 +258,63 @@ class FetchAgent(BaseAgent):
 
         # 4. fetch manifests + README + CI configs concurrently
         async def _fetch_named(paths: List[str]) -> Dict[str, str]:
-            out: Dict[str, str] = {}
-            for p in paths:
-                content = await self._fetch_file_content(ctx.owner, ctx.repo, p, headers)
-                if content is not None:
-                    out[p] = content
-            return out
+            if not paths:
+                return {}
+            async def _fetch_one(p: str):
+                try:
+                    content = await self._fetch_file_content(
+                        ctx.owner,
+                        ctx.repo,
+                        p,
+                        headers,
+                    )
+                    return p, content
+                except Exception:
+                    return p, None
+            results = await asyncio.gather(*[_fetch_one(p) for p in paths])
+            return {p: c for p, c in results if c is not None}
+
+        # Select up to 10 key source files to fetch content for
+        source_exts = {".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java", ".cs", ".rb", ".ipynb"}
+        ignore_keywords = {"test", "spec", "node_modules", "vendor", "dist", "build", "CI", ".github", ".git"}
+        
+        source_files = [
+            p for p in tree
+            if any(p.endswith(ext) for ext in source_exts)
+            and not any(k in p.lower() for k in ignore_keywords)
+        ][:10]
+
+        from models.schemas import RepoFile
+        source_contents = await _fetch_named(source_files)
+        files_dict = {}
+        for p, content in source_contents.items():
+            if p.endswith(".ipynb"):
+                import json
+                try:
+                    nb = json.loads(content)
+                    cells = nb.get("cells", [])
+                    extracted = []
+                    for idx, cell in enumerate(cells):
+                        if cell.get("cell_type") == "code":
+                            source = cell.get("source", [])
+                            if isinstance(source, list):
+                                extracted.append(f"# --- Cell {idx} ---")
+                                extracted.extend(source)
+                                extracted.append("\n")
+                            elif isinstance(source, str):
+                                extracted.append(f"# --- Cell {idx} ---")
+                                extracted.append(source)
+                                extracted.append("\n")
+                    content = "".join(extracted)
+                except Exception:
+                    pass
+
+            files_dict[p] = RepoFile(
+                path=p,
+                size=len(content),
+                content=content,
+                is_binary=False
+            )
 
         manifests, readme, ci_configs = await asyncio.gather(
             _fetch_named(manifest_paths),
@@ -289,6 +340,7 @@ class FetchAgent(BaseAgent):
             repo=ctx.repo,
             default_branch=branch,
             file_tree=tree,
+            files=files_dict,
             manifests=manifests,
             recent_commits=commits,
             open_prs=prs,

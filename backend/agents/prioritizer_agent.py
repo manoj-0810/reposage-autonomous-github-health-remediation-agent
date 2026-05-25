@@ -58,12 +58,16 @@ class PrioritizerAgent(BaseAgent):
         Severity.LOW: 1.0,
     }
 
-    async def _llm_blast_radius(self, findings: List[AuditFinding], use_gemini: bool = False) -> Dict[int, int]:
-        """Ask Groq Llama 3.3 or Gemini Flash for blast-radius estimates."""
+    async def _llm_blast_radius(self, findings: List[AuditFinding]) -> Dict[int, int]:
+        """Ask Groq Llama 3.3 for blast-radius estimates."""
         if not findings:
             return {}
         import os
         import httpx
+        api_key = os.getenv("GROQ_API_KEY", "")
+        if not api_key:
+            # fallback: heuristic based on category (no GROQ_API_KEY set)
+            return {i: 3 for i in range(len(findings))}
 
         # slim JSON to fit context window
         slim = []
@@ -77,47 +81,6 @@ class PrioritizerAgent(BaseAgent):
             })
 
         prompt = _PROMPT.format(findings_json=json.dumps(slim[:50]))
-
-        if use_gemini:
-            api_key = os.getenv("GEMINI_API_KEY", "")
-            if not api_key:
-                return {i: 3 for i in range(len(findings))}
-            url = (
-                f"https://generativelanguage.googleapis.com/v1beta/models/"
-                f"gemini-2.5-flash:generateContent?key={api_key}"
-            )
-            body = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4096},
-            }
-            try:
-                async with httpx.AsyncClient(timeout=60.0) as client:
-                    r = await client.post(url, json=body)
-                    r.raise_for_status()
-                    data = r.json()
-                candidates = data.get("candidates", [])
-                if not candidates:
-                    return {i: 3 for i in range(len(findings))}
-                content = candidates[0]["content"]["parts"][0].get("text", "{}")
-                # extract JSON
-                import re as _re
-                m = _re.search(r'\{.*\}', content, _re.DOTALL)
-                if not m:
-                    return {i: 3 for i in range(len(findings))}
-                obj = json.loads(m.group())
-                scores = {}
-                for entry in obj.get("scores", []):
-                    scores[entry["index"]] = entry.get("blast_radius", 3)
-                return scores
-            except Exception:
-                return {i: 3 for i in range(len(findings))}
-
-        # Standard Groq path
-        api_key = os.getenv("GROQ_API_KEY", "")
-        if not api_key:
-            # fallback: heuristic based on category (no GROQ_API_KEY set)
-            return {i: 3 for i in range(len(findings))}
-
         url = "https://api.groq.com/openai/v1/chat/completions"
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         body = {
@@ -145,28 +108,12 @@ class PrioritizerAgent(BaseAgent):
             return {i: 3 for i in range(len(findings))}
 
     async def run(self, context: AgentContext) -> AgentResult:
-        if not context.findings:
-            context.prioritized = PrioritizedResult(
-                top_findings=[],
-                themes=[],
-                health_score_breakdown={
-                    "security": 100.0,
-                    "dependencies": 100.0,
-                    "code_quality": 100.0,
-                    "test_coverage": 100.0,
-                },
-            )
-            return AgentResult(success=True, data={"top_n": 0})
-
-        findings = context.findings
+        findings = context.findings or []
         self._emit(context, AgentStatus.RUNNING,
                    f"Prioritizing {len(findings)} findings …")
 
-        file_tree_len = len(context.snapshot.file_tree) if context.snapshot else 0
-        use_gemini = file_tree_len <= 15
-
         # 1. get blast radius from LLM
-        blast_map = await self._llm_blast_radius(findings, use_gemini=use_gemini)
+        blast_map = await self._llm_blast_radius(findings)
 
         # 2. compute priority score for each
         scored: List[Tuple[float, AuditFinding, int]] = []
@@ -181,19 +128,68 @@ class PrioritizerAgent(BaseAgent):
         scored.sort(key=lambda x: x[0], reverse=True)
         top_findings = [f for _, f, _ in scored[:10]]
 
-        # 4. compute health score breakdown (0=terrible, 100=perfect)
+        # 4. compute health score breakdown (0=terrible, 100=perfect) with structural signals
+        has_security_md = False
+        has_dependabot = False
+        has_ci = False
+        has_linter = False
+        has_tests = False
+
+        if context.snapshot:
+            tree = context.snapshot.file_tree
+            has_security_md = any(p.lower().endswith("security.md") for p in tree)
+            has_dependabot = any("dependabot" in p.lower() or "renovate" in p.lower() for p in tree)
+            has_ci = len(context.snapshot.ci_config) > 0
+            linter_files = {".eslintrc", ".eslintignore", "pyproject.toml", "ruff.toml", ".prettierrc", "tslint.json", ".golangci.yml"}
+            has_linter = any(p.rsplit("/", 1)[-1] in linter_files for p in tree)
+            has_tests = any("test" in p.lower() or "spec" in p.lower() for p in tree)
+
+        # Finding severity penalties: Critical=20, High=12, Medium=6, Low=3
+        _SEV_PENALTY = {
+            Severity.CRITICAL: 20.0,
+            Severity.HIGH: 12.0,
+            Severity.MEDIUM: 6.0,
+            Severity.LOW: 3.0,
+        }
+
+        num_code_files = len(context.snapshot.files) if (context.snapshot and context.snapshot.files) else 0
+
         breakdown: Dict[str, float] = {}
         for cat in FindingCategory:
             cat_findings = [f for f in findings if f.category == cat]
-            if not cat_findings:
-                breakdown[cat.value] = 100.0
-                continue
-            # weighted average: critical=10pts off, high=6, medium=3, low=1
-            penalty = sum(
-                self._SEV_WEIGHT.get(f.severity, 1.0) * 2.5
-                for f in cat_findings
-            )
-            breakdown[cat.value] = max(0.0, 100.0 - penalty)
+            
+            # Start at perfect 100
+            score = 100.0
+            
+            # Subtract structural signals
+            if cat == FindingCategory.SECURITY and not has_security_md:
+                score -= 10.0
+            elif cat == FindingCategory.DEPENDENCIES and not has_dependabot:
+                score -= 10.0
+            elif cat == FindingCategory.CODE_QUALITY:
+                if not has_ci:
+                    score -= 15.0
+                if not has_linter:
+                    score -= 5.0
+            elif cat == FindingCategory.TEST_COVERAGE and not has_tests:
+                score -= 40.0
+
+            # Subtract empty/no-code penalties
+            if num_code_files == 0:
+                if cat == FindingCategory.SECURITY:
+                    score -= 40.0
+                elif cat == FindingCategory.DEPENDENCIES:
+                    score -= 40.0
+                elif cat == FindingCategory.CODE_QUALITY:
+                    score -= 60.0
+                elif cat == FindingCategory.TEST_COVERAGE:
+                    score -= 60.0
+
+            # Subtract finding penalties
+            finding_penalty = sum(_SEV_PENALTY.get(f.severity, 3.0) for f in cat_findings)
+            score -= finding_penalty
+
+            breakdown[cat.value] = max(0.0, min(99.0, score))
 
         # 5. group themes by directory prefix
         dir_groups: Dict[str, List[AuditFinding]] = defaultdict(list)
